@@ -14,6 +14,8 @@
     "./hardhat.config.ts",
     "./test/**/*",
     "./ignition/**/*",
-    "./typechain-types/**/*"
+    "./typechain-types/**/*",
+    "./agents/**/*",
+    "./scripts/**/*"
   ]
 }

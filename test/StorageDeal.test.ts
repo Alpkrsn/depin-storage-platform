@@ -1,51 +1,7 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { loadFixture, time } from "@nomicfoundation/hardhat-toolbox/network-helpers";
-
-// ---------- minimal Merkle tree (matches OpenZeppelin MerkleProof) ----------
-// OZ MerkleProof.verify uses sorted-pair keccak256 hashing:
-//   parent = keccak256(concat(min(a,b), max(a,b)))
-// We mirror that exactly so proofs generated here verify on-chain.
-
-function hashPair(a: string, b: string): string {
-  const [first, second] = a.toLowerCase() < b.toLowerCase() ? [a, b] : [b, a];
-  return ethers.keccak256(ethers.concat([first, second]));
-}
-
-function buildMerkleTree(leaves: string[]): {
-  root: string;
-  getProof: (index: number) => string[];
-} {
-  const layers: string[][] = [leaves.slice()];
-  let current = leaves.slice();
-  while (current.length > 1) {
-    const next: string[] = [];
-    for (let i = 0; i < current.length; i += 2) {
-      const left = current[i];
-      const right = i + 1 < current.length ? current[i + 1] : current[i];
-      next.push(hashPair(left, right));
-    }
-    layers.push(next);
-    current = next;
-  }
-  const root = current[0];
-
-  function getProof(index: number): string[] {
-    const proof: string[] = [];
-    let idx = index;
-    for (let level = 0; level < layers.length - 1; level++) {
-      const layer = layers[level];
-      const isRight = idx % 2 === 1;
-      const siblingIdx = isRight ? idx - 1 : idx + 1;
-      const sibling = siblingIdx < layer.length ? layer[siblingIdx] : layer[idx];
-      proof.push(sibling);
-      idx = Math.floor(idx / 2);
-    }
-    return proof;
-  }
-
-  return { root, getProof };
-}
+import { buildMerkleTree } from "../agents/lib/merkle";
 
 // helper: 4 leaves derived from chunk indices
 function makeLeaves(count: number): string[] {

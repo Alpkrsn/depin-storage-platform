@@ -148,3 +148,10 @@ cache/
 typechain-types/
 coverage.json
 
+# Ephemeral local Ignition deployments. Keep sepolia / mainnet artefacts so
+# the team can reuse deployed addresses; ignore localhost-only chain-31337.
+ignition/deployments/chain-31337/
+
+# Provider's local chunk store
+.provider-storage/
+
