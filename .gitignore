@@ -146,4 +146,5 @@ vite.config.ts.timestamp-*
 artifacts/
 cache/
 typechain-types/
+coverage.json
 
