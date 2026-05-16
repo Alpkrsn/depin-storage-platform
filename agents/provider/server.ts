@@ -43,7 +43,10 @@ async function readRequestBody(req: http.IncomingMessage): Promise<Buffer> {
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  });
   res.end(JSON.stringify(body));
 }
 
@@ -77,6 +80,16 @@ export async function startProviderServer(cfg: Config = loadConfig()): Promise<{
 
   const server = http.createServer(async (req, res) => {
     try {
+      // Permissive CORS for the local dashboard. Safe — server is bound to localhost.
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        });
+        return res.end();
+      }
+
       const url = new URL(req.url ?? "", "http://localhost");
 
       if (req.method === "GET" && url.pathname === "/health") {
@@ -160,7 +173,10 @@ export async function startProviderServer(cfg: Config = loadConfig()): Promise<{
         for (const f of sorted) {
           parts.push(await fs.readFile(path.join(dealDir, f)));
         }
-        res.writeHead(200, { "Content-Type": "application/octet-stream" });
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Access-Control-Allow-Origin": "*",
+        });
         return res.end(Buffer.concat(parts));
       }
 

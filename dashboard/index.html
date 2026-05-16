@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DePIN Storage Marketplace</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>DePIN Storage Marketplace <small>· COM4532 Group 19</small></h1>
+  <div id="status" class="badge">Connecting…</div>
+</header>
+
+<main>
+  <section id="providers-section">
+    <h2>Providers</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Address</th>
+          <th>Capacity (GB)</th>
+          <th>Price/GB</th>
+          <th>Stake (ETH)</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="providers-tbody"></tbody>
+    </table>
+  </section>
+
+  <section id="deals-section">
+    <h2>Deals</h2>
+    <div id="deals-list"><em>loading…</em></div>
+  </section>
+
+  <section id="events-section">
+    <h2>Events</h2>
+    <ul id="events-log"></ul>
+  </section>
+</main>
+
+<footer>
+  <button id="demo-btn">▶ Run Demo Deal</button>
+  <button id="reset-btn">⟲ Reset Chain</button>
+  <span id="footer-hint">Demo creates a fresh deal with a 30s deadline. Wait for the timer, then click "Close Deal" on the card.</span>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.16.0/dist/ethers.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

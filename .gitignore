@@ -155,3 +155,6 @@ ignition/deployments/chain-31337/
 # Provider's local chunk store
 .provider-storage/
 
+# Generated at runtime by scripts/dev.ts
+dashboard/addresses.json
+
