@@ -4,7 +4,13 @@
   "description": "DePIN-style decentralized storage sharing platform - COM4532 Group 19",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "coverage": "hardhat coverage",
+    "node": "hardhat node",
+    "deploy:local": "hardhat ignition deploy ignition/modules/DePIN.ts --network localhost",
+    "dev": "hardhat run scripts/dev.ts --network localhost",
+    "demo": "hardhat run scripts/demo-e2e.ts --network localhost"
   },
   "repository": {
     "type": "git",
