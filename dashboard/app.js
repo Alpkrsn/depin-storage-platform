@@ -816,17 +816,41 @@ async function closeDealCmd(dealId) {
 }
 
 async function resetChain() {
-  if (!confirm("Reset the local chain? All deals + providers will be wiped. You'll need to re-run the dev script.")) return;
+  if (!confirm(
+    "Wipe the local chain and re-deploy everything from scratch?\n\n" +
+    "All deals, providers, and balances will be reset. The dashboard will " +
+    "automatically redeploy the contracts and re-register all 3 providers, " +
+    "then reload — no terminal action needed."
+  )) return;
+  const btn = document.getElementById("reset-btn");
+  btn.disabled = true;
+  const originalText = btn.textContent;
   try {
-    appendEvent("== hardhat_reset ==", "ev-info");
+    btn.textContent = "⟲ Resetting…";
+    appendEvent("== hardhat_reset + redeploy ==", "ev-info");
+
+    // Step 1: wipe chain state.
     await fetch(cfg.rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", method: "hardhat_reset", params: [], id: 1 }),
     });
-    appendEvent("Chain reset. Restart `scripts/dev.ts` to re-deploy.", "ev-info");
+
+    // Step 2: ask the dev script (same origin) to redeploy + re-register.
+    btn.textContent = "⟲ Redeploying…";
+    const resp = await fetch("/redeploy", { method: "POST" });
+    const body = await resp.json();
+    if (!resp.ok || !body.ok) throw new Error(body.error ?? `HTTP ${resp.status}`);
+
+    appendEvent(`Redeployed: registry=${shortAddr(body.addresses.registry)}, storageDeal=${shortAddr(body.addresses.storageDeal)}. Reloading…`, "ev-success");
+
+    // Step 3: reload the page so all dashboard state (addresses, dealMemory,
+    // openTxDetails, etc.) starts fresh and consistent with the new chain.
+    setTimeout(() => window.location.reload(), 600);
   } catch (e) {
-    appendEvent(`ERROR: ${e.message}`, "ev-err");
+    appendEvent(`ERROR: ${e.message ?? String(e)}`, "ev-err");
+    btn.textContent = originalText;
+    btn.disabled = false;
   }
 }
 
