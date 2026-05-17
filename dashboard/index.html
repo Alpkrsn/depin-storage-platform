@@ -11,6 +11,35 @@
   <div id="status" class="badge">Connecting…</div>
 </header>
 
+<div id="stats-bar">
+  <div class="stat-tile">
+    <div class="stat-label">Deals</div>
+    <div class="stat-value" id="stat-deals">—</div>
+    <div class="stat-sub" id="stat-deals-sub">— completed · — slashed</div>
+  </div>
+  <div class="stat-tile">
+    <div class="stat-label">ETH in escrow</div>
+    <div class="stat-value" id="stat-escrow">—</div>
+    <div class="stat-sub">locked in active deals</div>
+  </div>
+  <div class="stat-tile">
+    <div class="stat-label">Total gas used</div>
+    <div class="stat-value" id="stat-gas">—</div>
+    <div class="stat-sub">across all on-chain ops</div>
+  </div>
+  <div class="stat-tile">
+    <div class="stat-label">Slash rate</div>
+    <div class="stat-value" id="stat-slash">—</div>
+    <div class="stat-sub">protocol-enforced</div>
+  </div>
+  <div class="stat-tile compare" title="Centralized storage has predictable transaction-level cost but requires trusting one provider with full vendor lock-in. Our DePIN prototype trades higher gas overhead (on mainnet) for permissionless participation and cryptoeconomic enforcement — no trust required.">
+    <div class="stat-label">vs AWS S3 (100 GB / mo)</div>
+    <div class="cmp-row"><span class="cmp-side">AWS</span><span class="cmp-val">$2.30/mo</span></div>
+    <div class="cmp-row"><span class="cmp-side">Ours</span><span class="cmp-val">~$0.50–27 per deal</span></div>
+    <div class="stat-sub">L2 vs mainnet gas; no vendor lock-in</div>
+  </div>
+</div>
+
 <main>
   <section id="providers-section">
     <h2>Providers</h2>
@@ -40,10 +69,14 @@
 </main>
 
 <footer>
-  <button id="demo-btn" title="Happy path: consumer uploads, provider stores + attests every chunk, payment goes to provider on close.">▶ Run Demo Deal</button>
-  <button id="slash-demo-btn" class="warn-btn" title="Failure path: deal is created but the file is NEVER uploaded — provider can't prove storage. On close, consumer gets escrow refund AND provider stake is slashed.">▶ Run Slash Demo</button>
+  <span class="provider-select-wrap">
+    <label for="provider-select">Provider:</label>
+    <select id="provider-select"><option value="">loading…</option></select>
+  </span>
+  <button id="demo-btn" title="Happy path: consumer uploads to the SELECTED provider, who stores + attests every chunk. Payment goes to provider on close. If selected provider is OFFLINE, upload is skipped (= same as slash demo) — useful for showing that the protocol protects you even from absent providers.">▶ Run Demo Deal</button>
+  <button id="slash-demo-btn" class="warn-btn" title="Failure path: deal is created with the selected provider but the file is NEVER uploaded — even an online provider gets slashed if no proofs are submitted.">▶ Run Slash Demo</button>
   <button id="reset-btn">⟲ Reset Chain</button>
-  <span id="footer-hint">Both demos use a 30s deadline. Wait for the timer, then click "Close Deal" on the card.</span>
+  <span id="footer-hint">Pick any provider. Online (🟢) actually serves files. Offline (⚪) shows what happens when a registered provider can't deliver — auto-slash on close.</span>
 </footer>
 
 <script src="https://cdn.jsdelivr.net/npm/ethers@6.16.0/dist/ethers.umd.min.js"></script>

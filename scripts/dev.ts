@@ -25,11 +25,22 @@ import { startProviderServer } from "../agents/provider/server";
 import { ProviderRegistry__factory } from "../typechain-types";
 
 const PROVIDER_KEY =
-  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"; // signer 1
+  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"; // signer 1 (online provider)
 const DASHBOARD_PORT = 3000;
 const PROVIDER_PORT = 8080;
 const RPC_URL = "http://127.0.0.1:8545";
 const PROVIDER_STORAGE_DIR = "./.provider-storage";
+
+// Three providers are registered to make the marketplace visible in the
+// dashboard. Only the first one runs an HTTP server (PROVIDER_KEY above),
+// so deals created in the demo go to signer #1. The others demonstrate
+// that the on-chain registry is a real list, not a single hardcoded slot.
+type ProviderSpec = { signerIndex: number; capacityGB: bigint; pricePerGB: bigint; stake: bigint };
+const PROVIDER_REGISTRATIONS: ProviderSpec[] = [
+  { signerIndex: 1, capacityGB: 1000n, pricePerGB: 100n, stake: 5_000_000_000_000_000_000n }, // 5 ETH
+  { signerIndex: 3, capacityGB:  500n, pricePerGB:  50n, stake: 3_000_000_000_000_000_000n }, // 3 ETH (cheapest)
+  { signerIndex: 4, capacityGB: 2000n, pricePerGB: 200n, stake: 10_000_000_000_000_000_000n },// 10 ETH (largest)
+];
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -51,19 +62,29 @@ async function main(): Promise<void> {
   console.log(`   ProviderRegistry: ${registryAddr}`);
   console.log(`   StorageDeal:      ${storageDealAddr}\n`);
 
-  // 2. Register provider if not already active
-  const [, providerSigner] = await ethers.getSigners();
-  const registry = ProviderRegistry__factory.connect(registryAddr, providerSigner);
-  const existing = await registry.getProvider(providerSigner.address);
-  if (!existing.active) {
-    console.log("2. Registering provider with 5 ETH stake...");
+  // 2. Register providers (skip any already-active to make the script idempotent)
+  console.log("2. Registering providers...");
+  const signers = await ethers.getSigners();
+  for (const spec of PROVIDER_REGISTRATIONS) {
+    const signer = signers[spec.signerIndex];
+    const registry = ProviderRegistry__factory.connect(registryAddr, signer);
+    const existing = await registry.getProvider(signer.address);
+    if (existing.active) {
+      console.log(`   - ${signer.address} already active (signer #${spec.signerIndex})`);
+      continue;
+    }
     await (
-      await registry.registerProvider(1000n, 100n, { value: ethers.parseEther("5") })
+      await registry.registerProvider(spec.capacityGB, spec.pricePerGB, { value: spec.stake })
     ).wait();
-    console.log(`   provider ${providerSigner.address} registered\n`);
-  } else {
-    console.log(`2. Provider ${providerSigner.address} already active\n`);
+    console.log(
+      `   - ${signer.address} registered (signer #${spec.signerIndex}, ` +
+        `cap=${spec.capacityGB}GB, price=${spec.pricePerGB} wei/GB, stake=${ethers.formatEther(spec.stake)} ETH)`
+    );
   }
+  console.log();
+
+  // Signer #1 is the one running the HTTP server, so demos route deals to it.
+  const providerSigner = signers[1];
 
   // 3. Provider HTTP server
   console.log("3. Starting provider HTTP server...");

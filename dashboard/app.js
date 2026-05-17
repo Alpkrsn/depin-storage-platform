@@ -36,6 +36,16 @@ let registry = null;
 let storageDeal = null;
 let lastBlock = 0;
 
+// Per-deal in-browser memory for demo deals we created here. The chain stores
+// only the root + status, so we keep the chunked leaves + tree locally so we
+// can render the full Merkle tree visualization.
+const dealMemory = new Map(); // dealId (string) -> { leaves, tree, txHashes: { createDeal, closeDeal } }
+// Cached "is the provider HTTP server reachable?" flag (per provider address)
+const providerOnline = new Map(); // address -> boolean
+// Deals whose Transactions panel is expanded — preserved across the 2s refresh
+// loop that re-renders the entire deals list.
+const openTxDetails = new Set(); // dealId (string)
+
 // ===== bootstrap =====
 
 async function init() {
@@ -64,8 +74,23 @@ async function init() {
   document.getElementById("slash-demo-btn").addEventListener("click", runSlashDemo);
   document.getElementById("reset-btn").addEventListener("click", resetChain);
 
+  // Best-effort online check for the single locally-running provider HTTP server.
+  // The address it signs as comes from dev.ts (cfg.providerSigner). Other
+  // registered providers will show as "offline" — they exist on-chain but have
+  // no HTTP server running.
+  await pingProvider(cfg.providerSigner, cfg.providerUrl);
+
   await refresh();
   setInterval(refresh, 2000);
+}
+
+async function pingProvider(address, url) {
+  try {
+    const r = await fetch(`${url}/health`, { method: "GET" });
+    providerOnline.set(address.toLowerCase(), r.ok);
+  } catch {
+    providerOnline.set(address.toLowerCase(), false);
+  }
 }
 
 function setStatus(text, ok) {
@@ -78,10 +103,107 @@ function setStatus(text, ok) {
 
 async function refresh() {
   try {
-    await Promise.all([refreshProviders(), refreshDeals(), refreshEvents()]);
+    await Promise.all([
+      refreshProviders(),
+      refreshProviderSelect(),
+      refreshDeals(),
+      refreshEvents(),
+      refreshStats(),
+    ]);
   } catch (e) {
     console.error("refresh:", e);
   }
+}
+
+// Aggregate stats shown in the top banner. Computed by iterating all deals
+// (we cap at 50 to keep the dashboard responsive at very large scales).
+async function refreshStats() {
+  const next = Number(await storageDeal.getNextDealId());
+  if (next === 0) {
+    document.getElementById("stat-deals").textContent = "0";
+    document.getElementById("stat-deals-sub").textContent = "0 completed · 0 slashed";
+    document.getElementById("stat-escrow").textContent = "0";
+    document.getElementById("stat-gas").textContent = "—";
+    document.getElementById("stat-slash").textContent = "—";
+    return;
+  }
+  const max = Math.min(next, 50);
+  const deals = await Promise.all(
+    Array.from({ length: max }, (_, i) => storageDeal.getDeal(next - 1 - i))
+  );
+  let completed = 0, slashed = 0, escrowLocked = 0n;
+  for (const d of deals) {
+    const st = Number(d.status);
+    if (st === 1) completed++;
+    else if (st === 2) slashed++;
+    else escrowLocked += d.escrow;
+  }
+  const total = deals.length;
+  const closed = completed + slashed;
+
+  document.getElementById("stat-deals").textContent = total.toString();
+  document.getElementById("stat-deals-sub").textContent =
+    `${completed} completed · ${slashed} slashed · ${total - closed} active`;
+  document.getElementById("stat-escrow").textContent =
+    `${Number(ethers.formatEther(escrowLocked)).toFixed(3)} ETH`;
+  document.getElementById("stat-slash").textContent =
+    closed === 0 ? "—" : `${Math.round((slashed / closed) * 100)}%`;
+
+  // Total gas: query the contract address' transactions via block scan would be
+  // expensive — we approximate by summing the gas in tx receipts of all events
+  // we know about for the closed deals. This is "gas in this dashboard's view"
+  // rather than every tx ever, but it's the honest visible number.
+  const evFilters = [
+    storageDeal.filters.DealCreated(),
+    storageDeal.filters.ProofSubmitted(),
+    storageDeal.filters.DealCompleted(),
+    storageDeal.filters.DealSlashed(),
+  ];
+  const evGroups = await Promise.all(
+    evFilters.map((f) => storageDeal.queryFilter(f, 0, "latest"))
+  );
+  const uniqueTxs = new Set();
+  evGroups.flat().forEach((e) => uniqueTxs.add(e.transactionHash));
+  let totalGas = 0;
+  await Promise.all(
+    [...uniqueTxs].map(async (h) => {
+      const r = await provider.getTransactionReceipt(h);
+      if (r) totalGas += Number(r.gasUsed);
+    })
+  );
+  document.getElementById("stat-gas").textContent =
+    totalGas === 0 ? "—" : totalGas.toLocaleString();
+}
+
+async function refreshProviderSelect() {
+  const sel = document.getElementById("provider-select");
+  const previous = sel.value;
+  const actives = await registry.getActiveProviders();
+  if (actives.length === 0) {
+    sel.innerHTML = `<option value="">(no active providers)</option>`;
+    return;
+  }
+  const opts = await Promise.all(
+    actives.map(async (addr) => {
+      const p = await registry.getProvider(addr);
+      const online = providerOnline.get(addr.toLowerCase()) === true;
+      const dot = online ? "🟢" : "⚪";
+      const label = `${dot} ${shortAddr(addr)} · ${p.pricePerGB} wei/GB · ${p.capacityGB} GB`;
+      return `<option value="${addr}" data-online="${online}">${label}</option>`;
+    })
+  );
+  sel.innerHTML = opts.join("");
+  // Preserve user's selection across refreshes if still valid.
+  if (previous && Array.from(sel.options).some((o) => o.value === previous)) {
+    sel.value = previous;
+  }
+}
+
+function getSelectedProvider() {
+  const sel = document.getElementById("provider-select");
+  const opt = sel.options[sel.selectedIndex];
+  if (!opt || !opt.value) return null;
+  return { address: opt.value, online: opt.dataset.online === "true" };
 }
 
 async function refreshProviders() {
@@ -94,26 +216,269 @@ async function refreshProviders() {
   const rows = await Promise.all(
     actives.map(async (addr) => {
       const p = await registry.getProvider(addr);
+      const online = providerOnline.get(addr.toLowerCase()) === true;
+      const statusBadge = online
+        ? `<span class="badge ok" title="HTTP server reachable">🟢 Online</span>`
+        : `<span class="badge offline" title="Registered on-chain but no HTTP server reachable">⚪ Offline</span>`;
       return `
         <tr>
           <td><code>${shortAddr(addr)}</code></td>
           <td>${p.capacityGB}</td>
           <td>${p.pricePerGB}</td>
           <td>${ethers.formatEther(p.stake)}</td>
-          <td><span class="badge active">Active</span></td>
+          <td>${statusBadge}</td>
         </tr>`;
     })
   );
   document.getElementById("providers-tbody").innerHTML = rows.join("");
 }
 
-async function countVerifiedChunks(dealId, totalChunks) {
+async function fetchVerifiedFlags(dealId, totalChunks) {
   const calls = [];
   for (let i = 0; i < totalChunks; i++) {
     calls.push(storageDeal.isChunkVerified(dealId, i));
   }
-  const results = await Promise.all(calls);
-  return results.filter(Boolean).length;
+  return Promise.all(calls);
+}
+
+async function countVerifiedChunks(dealId, totalChunks) {
+  const flags = await fetchVerifiedFlags(dealId, totalChunks);
+  return flags.filter(Boolean).length;
+}
+
+async function fetchChallengeIndex(dealId) {
+  // DealCompleted and DealSlashed both carry the challengeIndex as their
+  // second arg. Query both filters for the deal.
+  const completedFilter = storageDeal.filters.DealCompleted(dealId);
+  const slashedFilter = storageDeal.filters.DealSlashed(dealId);
+  const [c, s] = await Promise.all([
+    storageDeal.queryFilter(completedFilter, 0, "latest"),
+    storageDeal.queryFilter(slashedFilter, 0, "latest"),
+  ]);
+  const ev = c[0] ?? s[0];
+  return ev ? Number(ev.args.challengeIndex) : null;
+}
+
+// ===== Merkle tree SVG =====
+
+function buildFullTree(leaves) {
+  // Same algorithm as buildMerkleTree but returns every layer (not just root).
+  const layers = [leaves.slice()];
+  let current = leaves.slice();
+  while (current.length > 1) {
+    const next = [];
+    for (let i = 0; i < current.length; i += 2) {
+      const left = current[i];
+      const right = i + 1 < current.length ? current[i + 1] : current[i];
+      next.push(hashPair(left, right));
+    }
+    layers.push(next);
+    current = next;
+  }
+  return layers; // layers[0] = leaves, layers[layers.length-1] = [root]
+}
+
+// Returns the (layer, index) sequence from a challenged leaf up to the root.
+function pathToRoot(leafIndex, layers) {
+  const path = [];
+  let idx = leafIndex;
+  for (let l = 0; l < layers.length; l++) {
+    path.push({ layer: l, index: idx });
+    idx = Math.floor(idx / 2);
+  }
+  return path;
+}
+
+function renderMerkleSvg(leaves, verifiedFlags, challengeIndex) {
+  const layers = buildFullTree(leaves);
+  return renderTreeSvgFromLayers(layers, verifiedFlags, challengeIndex, /*havePreimages=*/ true);
+}
+
+function renderMerkleSvgPlaceholder(totalChunks, verifiedFlags, challengeIndex) {
+  // No leaf hashes available — fabricate placeholders just to draw shape.
+  const placeholderLeaves = Array.from({ length: totalChunks }, (_, i) =>
+    "0x" + i.toString(16).padStart(64, "0")
+  );
+  const layers = buildFullTree(placeholderLeaves);
+  return renderTreeSvgFromLayers(layers, verifiedFlags, challengeIndex, /*havePreimages=*/ false);
+}
+
+function renderTreeSvgFromLayers(layers, verifiedFlags, challengeIndex, havePreimages) {
+  const W = 320;
+  const NODE_R = 11;
+  const LAYER_H = 46;
+  const H = layers.length * LAYER_H + 10;
+
+  // x for each layer's nodes — leaves evenly, parents at midpoint of their children.
+  const xPositions = layers.map((layer, l) =>
+    l === 0
+      ? layer.map((_, i) => ((i + 0.5) * W) / layer.length)
+      : []
+  );
+  for (let l = 1; l < layers.length; l++) {
+    xPositions[l] = layers[l].map((_, i) => {
+      const leftX = xPositions[l - 1][i * 2];
+      const rightX = xPositions[l - 1][Math.min(i * 2 + 1, xPositions[l - 1].length - 1)];
+      return (leftX + rightX) / 2;
+    });
+  }
+
+  // y: top layer (root) near top, leaves at bottom.
+  const yFor = (l) => H - 10 - l * LAYER_H;
+
+  // Highlighted path = leaf -> root for the challenge.
+  const highlightSet = new Set();
+  if (challengeIndex !== null && challengeIndex >= 0) {
+    for (const { layer, index } of pathToRoot(challengeIndex, layers)) {
+      highlightSet.add(`${layer}:${index}`);
+    }
+  }
+
+  let svg = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" class="merkle-svg">`;
+
+  // Edges first so nodes draw on top.
+  for (let l = 0; l < layers.length - 1; l++) {
+    layers[l].forEach((_, i) => {
+      const parentIdx = Math.floor(i / 2);
+      const x1 = xPositions[l][i];
+      const y1 = yFor(l);
+      const x2 = xPositions[l + 1][parentIdx];
+      const y2 = yFor(l + 1);
+      const onPath = highlightSet.has(`${l}:${i}`) && highlightSet.has(`${l + 1}:${parentIdx}`);
+      svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" class="${onPath ? "edge edge-hl" : "edge"}"/>`;
+    });
+  }
+
+  // Nodes.
+  layers.forEach((layer, l) => {
+    layer.forEach((hash, i) => {
+      const x = xPositions[l][i];
+      const y = yFor(l);
+      const isLeaf = l === 0;
+      const verified = isLeaf && verifiedFlags[i] === true;
+      const onPath = highlightSet.has(`${l}:${i}`);
+      const isChallenged = onPath && isLeaf;
+      const classes = [
+        "node",
+        isLeaf ? "leaf" : "internal",
+        l === layers.length - 1 ? "root" : "",
+        verified ? "verified" : "",
+        isChallenged ? "challenged" : "",
+        onPath ? "on-path" : "",
+      ].filter(Boolean).join(" ");
+      const label = havePreimages ? hash.slice(2, 6) : (isLeaf ? `c${i}` : "");
+      svg += `<circle cx="${x}" cy="${y}" r="${NODE_R}" class="${classes}"/>`;
+      if (label) {
+        svg += `<text x="${x}" y="${y + 3}" text-anchor="middle" class="node-label">${label}</text>`;
+      }
+    });
+  });
+
+  svg += `</svg>`;
+  return svg;
+}
+
+// ===== Transaction details =====
+
+// Friendly per-row explanation. Each blockchain action gets a one-line caption
+// so a viewer who has never seen a tx table can still follow what each row did.
+const TX_EXPLAIN = {
+  createDeal: "Consumer locked the escrow ETH in the StorageDeal contract.",
+  closeDeal:  "Anyone called closeDeal after the deadline — the contract picked a random challenge chunk and either paid the provider or slashed them.",
+};
+function explainProofRow(chunkIndex) {
+  return `Provider proved chunk #${chunkIndex} is stored by submitting a Merkle proof; the contract verified it on-chain.`;
+}
+
+async function renderTxDetails(dealId, mem) {
+  // Aggregate every tx hash we know about for this deal:
+  // - createDeal hash from local memory (only if dashboard made the deal)
+  // - submitProof tx hashes from on-chain ProofSubmitted events
+  // - closeDeal hash from local memory or DealCompleted/Slashed events
+  const rows = [];
+
+  if (mem && mem.txHashes && mem.txHashes.createDeal) {
+    rows.push({ label: "createDeal", hash: mem.txHashes.createDeal, explain: TX_EXPLAIN.createDeal });
+  }
+
+  // Proof submissions are public — anyone can find them via events.
+  const proofFilter = storageDeal.filters.ProofSubmitted(dealId);
+  const proofEvents = await storageDeal.queryFilter(proofFilter, 0, "latest");
+  proofEvents.forEach((e) => {
+    const chunkIndex = Number(e.args.chunkIndex);
+    rows.push({
+      label: `submitProof[${chunkIndex}]`,
+      hash: e.transactionHash,
+      explain: explainProofRow(chunkIndex),
+    });
+  });
+
+  const closeFilter1 = storageDeal.filters.DealCompleted(dealId);
+  const closeFilter2 = storageDeal.filters.DealSlashed(dealId);
+  const [c, s] = await Promise.all([
+    storageDeal.queryFilter(closeFilter1, 0, "latest"),
+    storageDeal.queryFilter(closeFilter2, 0, "latest"),
+  ]);
+  const closeEv = c[0] ?? s[0];
+  if (closeEv) rows.push({ label: "closeDeal", hash: closeEv.transactionHash, explain: TX_EXPLAIN.closeDeal });
+
+  if (rows.length === 0) {
+    return {
+      count: 0,
+      html: `<div class="tx-intro">No on-chain transactions for this deal yet.</div>`,
+    };
+  }
+
+  // Fetch receipts in parallel for gas + block.
+  const enriched = await Promise.all(
+    rows.map(async (r) => {
+      const rec = await provider.getTransactionReceipt(r.hash);
+      return {
+        ...r,
+        block: rec ? Number(rec.blockNumber) : null,
+        gas: rec ? Number(rec.gasUsed) : null,
+        ok: rec ? rec.status === 1 : null,
+      };
+    })
+  );
+
+  const totalGas = enriched.reduce((s, r) => s + (r.gas ?? 0), 0);
+  const usd = (totalGas * 20e-9 * 3500).toFixed(4);
+
+  const html = `
+    <div class="tx-intro">
+      Every action you take here writes a real transaction to the local Ethereum chain.
+      Each row below is one of those transactions — the action it performed, which block it
+      landed in, the gas (computation) it consumed, and its unique identifier (hash).
+      In production these would be searchable on Etherscan.
+    </div>
+    <table class="tx-table">
+      <thead><tr>
+        <th title="What the transaction did">Action</th>
+        <th title="Which block the transaction was mined into">Block</th>
+        <th title="Computation units consumed — units of work on the EVM">Gas</th>
+        <th title="32-byte unique identifier; this is what you would paste into Etherscan">Tx hash</th>
+      </tr></thead>
+      <tbody>
+        ${enriched
+          .map(
+            (r) => `
+          <tr>
+            <td><div class="tx-action">${r.label}</div><div class="tx-explain">${r.explain ?? ""}</div></td>
+            <td>${r.block ?? "—"}</td>
+            <td>${r.gas != null ? r.gas.toLocaleString() : "—"}</td>
+            <td><code title="${r.hash}">${r.hash.slice(0, 10)}…${r.hash.slice(-6)}</code></td>
+          </tr>`
+          )
+          .join("")}
+      </tbody>
+    </table>
+    <div class="tx-foot">
+      <strong>Total gas: ${totalGas.toLocaleString()}</strong> · estimated mainnet cost @ 20 gwei ≈ <strong>$${usd}</strong>
+      (ETH @ $3500). Target from the proposal (NFR2): ≤ 500,000 gas for the full deal lifecycle.
+    </div>`;
+
+  return { count: enriched.length, html };
 }
 
 // Derive a human-readable lifecycle stage from on-chain state alone.
@@ -138,59 +503,104 @@ async function refreshDeals() {
   const ids = [];
   for (let i = next - 1; i >= 0 && i >= next - 10; i--) ids.push(i);
 
-  const cards = await Promise.all(
-    ids.map(async (id) => {
-      const d = await storageDeal.getDeal(id);
-      const statusIdx = Number(d.status);
-      const status = STATUS[statusIdx];
-      const cls = STATUS_CLASS[statusIdx];
-      const deadlineDelta = Number(d.deadline) - now;
-      const expired = deadlineDelta <= 0;
-      const total = Number(d.totalChunks);
-
-      // Per-deal verified-chunks query so the stage indicator can show progress.
-      const verified = statusIdx === 0 ? await countVerifiedChunks(id, total) : total;
-      const stage = computeStage(statusIdx, verified, total, expired);
-
-      const closeBtn =
-        statusIdx === 0
-          ? `<button class="close-btn" data-id="${id}" ${expired ? "" : "disabled"}>
-               ${expired ? "Close Deal" : `Wait ${deadlineDelta}s`}
-             </button>`
-          : "";
-
-      // Visual chunk strip: one square per chunk, filled if its proof is verified.
-      const chunkStrip = Array.from({ length: total }, (_, i) =>
-        `<span class="chunk ${i < verified ? "chunk-on" : "chunk-off"}" title="chunk ${i}"></span>`
-      ).join("");
-
-      return `
-        <div class="deal ${cls}">
-          <div class="deal-head">
-            <span class="deal-id">Deal #${id}</span>
-            <span class="badge ${cls}">${status}</span>
-          </div>
-          <div class="stage ${stage.cls}">
-            <span class="stage-icon">${stage.icon}</span>
-            <span class="stage-label">${stage.label}</span>
-          </div>
-          <div class="chunks" aria-label="proof attestation per chunk">${chunkStrip}</div>
-          <div class="deal-body">
-            <span class="label">Consumer</span><code>${shortAddr(d.consumer)}</code>
-            <span class="label">Provider</span><code>${shortAddr(d.provider)}</code>
-            <span class="label">Escrow</span><span>${ethers.formatEther(d.escrow)} ETH</span>
-            <span class="label">Chunks</span><span>${verified}/${total} attested</span>
-            <span class="label">Deadline</span><span>${expired ? "<em>expired</em>" : `${deadlineDelta}s left`}</span>
-            <span class="label">Root</span><code>${d.merkleRoot.slice(0, 14)}…</code>
-          </div>
-          ${closeBtn}
-        </div>`;
-    })
-  );
+  const cards = await Promise.all(ids.map((id) => renderDealCard(id, now)));
   document.getElementById("deals-list").innerHTML = cards.join("");
   document.querySelectorAll(".close-btn:not(:disabled)").forEach((btn) => {
     btn.addEventListener("click", () => closeDealCmd(BigInt(btn.dataset.id)));
   });
+  // Restore any "Transactions" panels the user had open before the refresh
+  // wiped the DOM, so refreshes don't close panels under the user's nose.
+  openTxDetails.forEach((dealId) => {
+    const el = document.getElementById(`tx-${dealId}`);
+    const btn = document.querySelector(`.details-toggle[data-target="tx-${dealId}"]`);
+    if (el && btn) {
+      el.classList.add("open");
+      btn.classList.add("open");
+    }
+  });
+  // Wire collapsible details and remember which ones the user opened.
+  document.querySelectorAll(".details-toggle").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const targetId = btn.dataset.target;
+      const tgt = document.getElementById(targetId);
+      if (!tgt) return;
+      const willOpen = !tgt.classList.contains("open");
+      tgt.classList.toggle("open", willOpen);
+      btn.classList.toggle("open", willOpen);
+      const dealId = targetId.replace("tx-", "");
+      if (willOpen) openTxDetails.add(dealId);
+      else openTxDetails.delete(dealId);
+    });
+  });
+}
+
+async function renderDealCard(id, now) {
+  const d = await storageDeal.getDeal(id);
+  const statusIdx = Number(d.status);
+  const status = STATUS[statusIdx];
+  const cls = STATUS_CLASS[statusIdx];
+  const deadlineDelta = Number(d.deadline) - now;
+  const expired = deadlineDelta <= 0;
+  const total = Number(d.totalChunks);
+
+  const verified = statusIdx === 0 ? await countVerifiedChunks(id, total) : total;
+  const stage = computeStage(statusIdx, verified, total, expired);
+
+  // For closed deals we need the challengeIndex (emitted in DealCompleted /
+  // DealSlashed). It tells us which leaf the contract challenged so we can
+  // highlight the Merkle path used for settlement.
+  let challengeIndex = null;
+  if (statusIdx !== 0) {
+    challengeIndex = await fetchChallengeIndex(id);
+  }
+
+  // Merkle tree visualization. We need the actual leaf hashes (chain only
+  // stores the root). If this dashboard created the deal, we have them in
+  // dealMemory; otherwise we render a placeholder tree with anonymous nodes.
+  const mem = dealMemory.get(id.toString());
+  const verifiedFlags = await fetchVerifiedFlags(id, total);
+  const treeSvg = mem
+    ? renderMerkleSvg(mem.leaves, verifiedFlags, challengeIndex)
+    : renderMerkleSvgPlaceholder(total, verifiedFlags, challengeIndex);
+
+  const closeBtn =
+    statusIdx === 0
+      ? `<button class="close-btn" data-id="${id}" ${expired ? "" : "disabled"}>
+           ${expired ? "Close Deal" : `Wait ${deadlineDelta}s`}
+         </button>`
+      : "";
+
+  const txDetailsId = `tx-${id}`;
+  const txDetails = await renderTxDetails(id, mem);
+
+  return `
+    <div class="deal ${cls}">
+      <div class="deal-head">
+        <span class="deal-id">Deal #${id}</span>
+        <span class="badge ${cls}">${status}</span>
+      </div>
+      <div class="stage ${stage.cls}">
+        <span class="stage-icon">${stage.icon}</span>
+        <span class="stage-label">${stage.label}</span>
+      </div>
+      <div class="deal-body">
+        <span class="label">Consumer</span><code>${shortAddr(d.consumer)}</code>
+        <span class="label">Provider</span><code>${shortAddr(d.provider)}</code>
+        <span class="label">Escrow</span><span>${ethers.formatEther(d.escrow)} ETH</span>
+        <span class="label">Chunks</span><span>${verified}/${total} attested${challengeIndex !== null ? ` · challenged #${challengeIndex}` : ""}</span>
+        <span class="label">Deadline</span><span>${expired ? "<em>expired</em>" : `${deadlineDelta}s left`}</span>
+        <span class="label">Root</span><code title="${d.merkleRoot}">${d.merkleRoot.slice(0, 14)}…</code>
+      </div>
+      <div class="merkle-block">
+        <div class="merkle-caption">Merkle tree — ${mem ? "live leaves" : "placeholder (deal created outside dashboard)"}</div>
+        ${treeSvg}
+      </div>
+      <button class="details-toggle" data-target="${txDetailsId}">
+        <span class="caret">▸</span> On-chain transactions ${txDetails.count > 0 ? `(${txDetails.count})` : ""}
+      </button>
+      <div class="tx-details" id="${txDetailsId}">${txDetails.html}</div>
+      ${closeBtn}
+    </div>`;
 }
 
 async function refreshEvents() {
@@ -285,7 +695,12 @@ async function runDemo() {
   const btn = document.getElementById("demo-btn");
   btn.disabled = true;
   try {
-    appendEvent("== Starting demo deal ==", "ev-info");
+    const sel = getSelectedProvider();
+    if (!sel) {
+      appendEvent("ERROR: no provider selected", "ev-err");
+      return;
+    }
+    appendEvent(`== Starting demo deal with ${sel.online ? "🟢 ONLINE" : "⚪ OFFLINE"} provider ${shortAddr(sel.address)} ==`, "ev-info");
     const wallet = new ethers.Wallet(CONSUMER_KEY, provider);
     const sd = new ethers.Contract(cfg.storageDeal, STORAGE_DEAL_ABI, wallet);
 
@@ -297,12 +712,28 @@ async function runDemo() {
     const escrow = ethers.parseEther("0.05");
     const duration = 30n; // seconds
     appendEvent(`createDeal(provider, root, ${f.totalChunks}, ${duration}, value=0.05 ETH)`);
-    const tx = await sd.createDeal(cfg.providerSigner, f.tree.root, f.totalChunks, duration, { value: escrow });
+    const tx = await sd.createDeal(sel.address, f.tree.root, f.totalChunks, duration, { value: escrow });
     const receipt = await tx.wait();
     const log = receipt.logs.find((l) => l.address.toLowerCase() === cfg.storageDeal.toLowerCase());
     const parsed = sd.interface.parseLog(log);
     const dealId = parsed.args.dealId;
+    dealMemory.set(dealId.toString(), {
+      leaves: f.leaves,
+      tree: f.tree,
+      totalChunks: f.totalChunks,
+      txHashes: { createDeal: tx.hash },
+    });
     appendEvent(`Deal #${dealId} created (tx ${tx.hash.slice(0, 10)}…)`, "ev-success");
+
+    if (!sel.online) {
+      // Selected provider has no HTTP server — there's nothing to POST to.
+      // Skip upload entirely. The deal is on-chain but no proofs will ever
+      // be submitted, so closeDeal will take the slash path. This is the
+      // protocol's exact value proposition: you're protected from absent
+      // providers automatically.
+      appendEvent(`⚠️ Provider is OFFLINE — upload skipped. Wait ${duration}s, then close: consumer will receive 2× escrow (0.10 ETH), provider stake slashed.`, "ev-info");
+      return;
+    }
 
     appendEvent(`POST ${cfg.providerUrl}/store?dealId=${dealId}`);
     const resp = await fetch(`${cfg.providerUrl}/store?dealId=${dealId}`, {
@@ -329,7 +760,12 @@ async function runSlashDemo() {
   const btn = document.getElementById("slash-demo-btn");
   btn.disabled = true;
   try {
-    appendEvent("== Starting slash demo (provider goes silent) ==", "ev-info");
+    const sel = getSelectedProvider();
+    if (!sel) {
+      appendEvent("ERROR: no provider selected", "ev-err");
+      return;
+    }
+    appendEvent(`== Starting slash demo with ${sel.online ? "🟢 ONLINE" : "⚪ OFFLINE"} provider ${shortAddr(sel.address)} (silent regardless) ==`, "ev-info");
     const wallet = new ethers.Wallet(CONSUMER_KEY, provider);
     const sd = new ethers.Contract(cfg.storageDeal, STORAGE_DEAL_ABI, wallet);
 
@@ -341,11 +777,17 @@ async function runSlashDemo() {
     const escrow = ethers.parseEther("0.05");
     const duration = 30n;
     appendEvent(`createDeal(provider, root, ${f.totalChunks}, ${duration}, value=0.05 ETH)`);
-    const tx = await sd.createDeal(cfg.providerSigner, f.tree.root, f.totalChunks, duration, { value: escrow });
+    const tx = await sd.createDeal(sel.address, f.tree.root, f.totalChunks, duration, { value: escrow });
     const receipt = await tx.wait();
     const log = receipt.logs.find((l) => l.address.toLowerCase() === cfg.storageDeal.toLowerCase());
     const parsed = sd.interface.parseLog(log);
     const dealId = parsed.args.dealId;
+    dealMemory.set(dealId.toString(), {
+      leaves: f.leaves,
+      tree: f.tree,
+      totalChunks: f.totalChunks,
+      txHashes: { createDeal: tx.hash },
+    });
     appendEvent(`Deal #${dealId} created — file NOT uploaded. 0 proofs will be submitted.`, "ev-info");
     appendEvent(`Wait ${duration}s, then Close. Consumer will receive 2× escrow (0.10 ETH).`, "ev-info");
   } catch (e) {
@@ -362,6 +804,11 @@ async function closeDealCmd(dealId) {
     const sd = new ethers.Contract(cfg.storageDeal, STORAGE_DEAL_ABI, wallet);
     const tx = await sd.closeDeal(dealId);
     await tx.wait();
+    // Remember the close tx hash so the Transactions panel can show it.
+    const mem = dealMemory.get(dealId.toString());
+    if (mem) {
+      mem.txHashes = { ...(mem.txHashes ?? {}), closeDeal: tx.hash };
+    }
     appendEvent(`Deal #${dealId} close tx mined (tx ${tx.hash.slice(0, 10)}…)`, "ev-success");
   } catch (e) {
     appendEvent(`ERROR: ${e.message ?? String(e)}`, "ev-err");
