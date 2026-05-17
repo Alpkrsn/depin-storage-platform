@@ -18,6 +18,7 @@ const REGISTRY_ABI = [
 const STORAGE_DEAL_ABI = [
   "function getNextDealId() view returns (uint256)",
   "function getDeal(uint256) view returns (tuple(address consumer, uint64 deadline, uint32 totalChunks, address provider, uint88 escrow, uint8 status, bytes32 merkleRoot))",
+  "function isChunkVerified(uint256 dealId, uint256 chunkIndex) view returns (bool)",
   "function createDeal(address provider, bytes32 merkleRoot, uint32 totalChunks, uint64 duration) payable returns (uint256)",
   "function closeDeal(uint256 dealId)",
   "event DealCreated(uint256 indexed dealId, address indexed consumer, address indexed provider, bytes32 merkleRoot, uint256 totalChunks, uint256 escrow, uint256 deadline)",
@@ -60,6 +61,7 @@ async function init() {
   }
 
   document.getElementById("demo-btn").addEventListener("click", runDemo);
+  document.getElementById("slash-demo-btn").addEventListener("click", runSlashDemo);
   document.getElementById("reset-btn").addEventListener("click", resetChain);
 
   await refresh();
@@ -105,10 +107,31 @@ async function refreshProviders() {
   document.getElementById("providers-tbody").innerHTML = rows.join("");
 }
 
+async function countVerifiedChunks(dealId, totalChunks) {
+  const calls = [];
+  for (let i = 0; i < totalChunks; i++) {
+    calls.push(storageDeal.isChunkVerified(dealId, i));
+  }
+  const results = await Promise.all(calls);
+  return results.filter(Boolean).length;
+}
+
+// Derive a human-readable lifecycle stage from on-chain state alone.
+function computeStage(statusIdx, verified, total, expired) {
+  if (statusIdx === 1) return { label: "Completed", cls: "stage-ok",   icon: "✅" };
+  if (statusIdx === 2) return { label: "Slashed",   cls: "stage-err",  cls2: "stage-err", icon: "❌" };
+  // Active branches
+  if (verified === 0 && !expired)  return { label: "Awaiting upload",                cls: "stage-wait", icon: "⏳" };
+  if (verified === 0 && expired)   return { label: "Lazy provider — slash on close", cls: "stage-err",  icon: "⚠️" };
+  if (verified < total)            return { label: `Storing — ${verified}/${total} proofs`, cls: "stage-progress", icon: "📤" };
+  if (!expired)                    return { label: `Stored ✓ — awaiting deadline`,   cls: "stage-progress", icon: "⏱️" };
+  return                                   { label: "Ready to close",                cls: "stage-ready", icon: "✓" };
+}
+
 async function refreshDeals() {
   const next = Number(await storageDeal.getNextDealId());
   if (next === 0) {
-    document.getElementById("deals-list").innerHTML = `<em>No deals yet — click "Run Demo Deal" to make one.</em>`;
+    document.getElementById("deals-list").innerHTML = `<em>No deals yet — click "Run Demo Deal" or "Run Slash Demo" to make one.</em>`;
     return;
   }
   const now = Math.floor(Date.now() / 1000);
@@ -123,23 +146,40 @@ async function refreshDeals() {
       const cls = STATUS_CLASS[statusIdx];
       const deadlineDelta = Number(d.deadline) - now;
       const expired = deadlineDelta <= 0;
+      const total = Number(d.totalChunks);
+
+      // Per-deal verified-chunks query so the stage indicator can show progress.
+      const verified = statusIdx === 0 ? await countVerifiedChunks(id, total) : total;
+      const stage = computeStage(statusIdx, verified, total, expired);
+
       const closeBtn =
         statusIdx === 0
           ? `<button class="close-btn" data-id="${id}" ${expired ? "" : "disabled"}>
                ${expired ? "Close Deal" : `Wait ${deadlineDelta}s`}
              </button>`
           : "";
+
+      // Visual chunk strip: one square per chunk, filled if its proof is verified.
+      const chunkStrip = Array.from({ length: total }, (_, i) =>
+        `<span class="chunk ${i < verified ? "chunk-on" : "chunk-off"}" title="chunk ${i}"></span>`
+      ).join("");
+
       return `
         <div class="deal ${cls}">
           <div class="deal-head">
             <span class="deal-id">Deal #${id}</span>
             <span class="badge ${cls}">${status}</span>
           </div>
+          <div class="stage ${stage.cls}">
+            <span class="stage-icon">${stage.icon}</span>
+            <span class="stage-label">${stage.label}</span>
+          </div>
+          <div class="chunks" aria-label="proof attestation per chunk">${chunkStrip}</div>
           <div class="deal-body">
             <span class="label">Consumer</span><code>${shortAddr(d.consumer)}</code>
             <span class="label">Provider</span><code>${shortAddr(d.provider)}</code>
             <span class="label">Escrow</span><span>${ethers.formatEther(d.escrow)} ETH</span>
-            <span class="label">Chunks</span><span>${d.totalChunks}</span>
+            <span class="label">Chunks</span><span>${verified}/${total} attested</span>
             <span class="label">Deadline</span><span>${expired ? "<em>expired</em>" : `${deadlineDelta}s left`}</span>
             <span class="label">Root</span><code>${d.merkleRoot.slice(0, 14)}…</code>
           </div>
@@ -273,6 +313,41 @@ async function runDemo() {
     if (resp.status !== 200) throw new Error(`provider rejected: ${body.error}`);
     appendEvent(`Provider stored file + submitted ${body.submittedTxs.length} proofs ✓`, "ev-success");
     appendEvent(`Deadline in ${duration}s — wait for timer, then click "Close Deal"`, "ev-info");
+  } catch (e) {
+    appendEvent(`ERROR: ${e.message ?? String(e)}`, "ev-err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Slash-path demo: create a deal but deliberately SKIP the upload step.
+// The provider never gets a chance to submit proofs, so closeDeal after the
+// deadline takes the slash branch — consumer is refunded escrow AND paid out
+// from the provider's stake. Demonstrates the protocol's cryptoeconomic
+// guarantee: "trust = math + economics".
+async function runSlashDemo() {
+  const btn = document.getElementById("slash-demo-btn");
+  btn.disabled = true;
+  try {
+    appendEvent("== Starting slash demo (provider goes silent) ==", "ev-info");
+    const wallet = new ethers.Wallet(CONSUMER_KEY, provider);
+    const sd = new ethers.Contract(cfg.storageDeal, STORAGE_DEAL_ABI, wallet);
+
+    const data = new Uint8Array(3000);
+    crypto.getRandomValues(data);
+    const f = chunkFile(data, 512);
+    appendEvent(`Chunked: ${f.totalChunks} chunks, root=${f.tree.root.slice(0, 14)}…`);
+
+    const escrow = ethers.parseEther("0.05");
+    const duration = 30n;
+    appendEvent(`createDeal(provider, root, ${f.totalChunks}, ${duration}, value=0.05 ETH)`);
+    const tx = await sd.createDeal(cfg.providerSigner, f.tree.root, f.totalChunks, duration, { value: escrow });
+    const receipt = await tx.wait();
+    const log = receipt.logs.find((l) => l.address.toLowerCase() === cfg.storageDeal.toLowerCase());
+    const parsed = sd.interface.parseLog(log);
+    const dealId = parsed.args.dealId;
+    appendEvent(`Deal #${dealId} created — file NOT uploaded. 0 proofs will be submitted.`, "ev-info");
+    appendEvent(`Wait ${duration}s, then Close. Consumer will receive 2× escrow (0.10 ETH).`, "ev-info");
   } catch (e) {
     appendEvent(`ERROR: ${e.message ?? String(e)}`, "ev-err");
   } finally {

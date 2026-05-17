@@ -101,6 +101,40 @@ code {
   margin-bottom: 0.4rem;
 }
 .deal-id { font-weight: 600; color: #f0f6fc; }
+.stage {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.6rem;
+  margin: 0 0 0.5rem 0;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  border: 1px solid #30363d;
+  background: #0d1117;
+}
+.stage-icon { font-size: 0.9rem; }
+.stage.stage-wait     { border-color: #9e6a03; color: #d29922; }
+.stage.stage-progress { border-color: #1f6feb; color: #58a6ff; }
+.stage.stage-ready    { border-color: #1f6feb; color: #58a6ff; background: rgba(31,111,235,0.08); }
+.stage.stage-ok       { border-color: #238636; color: #7ee787; background: rgba(35,134,54,0.1); }
+.stage.stage-err      { border-color: #da3633; color: #ff7b72; background: rgba(218,54,51,0.08); }
+
+.chunks {
+  display: flex;
+  gap: 3px;
+  margin-bottom: 0.5rem;
+}
+.chunk {
+  flex: 1;
+  height: 8px;
+  border-radius: 2px;
+  background: #30363d;
+  transition: background 0.3s;
+}
+.chunk.chunk-on  { background: #238636; }
+.chunk.chunk-off { background: #30363d; }
+
 .deal-body {
   font-size: 0.8rem;
   display: grid;
@@ -159,6 +193,8 @@ footer button {
 }
 footer button:hover:not(:disabled) { background: #2ea043; }
 footer button:disabled { opacity: 0.5; cursor: not-allowed; }
+footer button.warn-btn { background: #9e6a03; }
+footer button.warn-btn:hover:not(:disabled) { background: #b8821e; }
 #reset-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
 #reset-btn:hover:not(:disabled) { background: #30363d; }
 #footer-hint { color: #8b949e; font-size: 0.8rem; }

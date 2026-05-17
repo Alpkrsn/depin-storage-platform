@@ -40,9 +40,10 @@
 </main>
 
 <footer>
-  <button id="demo-btn">▶ Run Demo Deal</button>
+  <button id="demo-btn" title="Happy path: consumer uploads, provider stores + attests every chunk, payment goes to provider on close.">▶ Run Demo Deal</button>
+  <button id="slash-demo-btn" class="warn-btn" title="Failure path: deal is created but the file is NEVER uploaded — provider can't prove storage. On close, consumer gets escrow refund AND provider stake is slashed.">▶ Run Slash Demo</button>
   <button id="reset-btn">⟲ Reset Chain</button>
-  <span id="footer-hint">Demo creates a fresh deal with a 30s deadline. Wait for the timer, then click "Close Deal" on the card.</span>
+  <span id="footer-hint">Both demos use a 30s deadline. Wait for the timer, then click "Close Deal" on the card.</span>
 </footer>
 
 <script src="https://cdn.jsdelivr.net/npm/ethers@6.16.0/dist/ethers.umd.min.js"></script>
