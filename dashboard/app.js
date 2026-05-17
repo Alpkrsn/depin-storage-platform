@@ -42,6 +42,10 @@ let lastBlock = 0;
 const dealMemory = new Map(); // dealId (string) -> { leaves, tree, txHashes: { createDeal, closeDeal } }
 // Cached "is the provider HTTP server reachable?" flag (per provider address)
 const providerOnline = new Map(); // address -> boolean
+// Per-provider URL lookup, built from cfg.providers (online providers only)
+const providerUrls = new Map(); // address (lowercase) -> url
+// Per-provider stats (served / slashed counts) computed from on-chain events
+const providerStats = new Map(); // address (lowercase) -> { served, slashed }
 // Deals whose Transactions panel is expanded — preserved across the 2s refresh
 // loop that re-renders the entire deals list.
 const openTxDetails = new Set(); // dealId (string)
@@ -74,23 +78,29 @@ async function init() {
   document.getElementById("slash-demo-btn").addEventListener("click", runSlashDemo);
   document.getElementById("reset-btn").addEventListener("click", resetChain);
 
-  // Best-effort online check for the single locally-running provider HTTP server.
-  // The address it signs as comes from dev.ts (cfg.providerSigner). Other
-  // registered providers will show as "offline" — they exist on-chain but have
-  // no HTTP server running.
-  await pingProvider(cfg.providerSigner, cfg.providerUrl);
+  // Build the URL lookup + ping each online provider's HTTP server. Any
+  // registered provider not in cfg.providers is treated as offline (on-chain
+  // listing only — no server running anywhere we know about).
+  (cfg.providers ?? []).forEach((p) => providerUrls.set(p.address.toLowerCase(), p.url));
+  await pingAllProviders();
 
   await refresh();
   setInterval(refresh, 2000);
+  // Re-ping the online providers every 10s in case one goes up/down mid-demo.
+  setInterval(pingAllProviders, 10_000);
 }
 
-async function pingProvider(address, url) {
-  try {
-    const r = await fetch(`${url}/health`, { method: "GET" });
-    providerOnline.set(address.toLowerCase(), r.ok);
-  } catch {
-    providerOnline.set(address.toLowerCase(), false);
-  }
+async function pingAllProviders() {
+  await Promise.all(
+    (cfg.providers ?? []).map(async (p) => {
+      try {
+        const r = await fetch(`${p.url}/health`, { method: "GET" });
+        providerOnline.set(p.address.toLowerCase(), r.ok);
+      } catch {
+        providerOnline.set(p.address.toLowerCase(), false);
+      }
+    })
+  );
 }
 
 function setStatus(text, ok) {
@@ -210,9 +220,12 @@ async function refreshProviders() {
   const actives = await registry.getActiveProviders();
   if (actives.length === 0) {
     document.getElementById("providers-tbody").innerHTML =
-      `<tr><td colspan="5"><em>No active providers</em></td></tr>`;
+      `<tr><td colspan="7"><em>No active providers</em></td></tr>`;
     return;
   }
+  // Refresh per-provider deal stats from on-chain events.
+  await refreshProviderStats();
+
   const rows = await Promise.all(
     actives.map(async (addr) => {
       const p = await registry.getProvider(addr);
@@ -220,17 +233,51 @@ async function refreshProviders() {
       const statusBadge = online
         ? `<span class="badge ok" title="HTTP server reachable">🟢 Online</span>`
         : `<span class="badge offline" title="Registered on-chain but no HTTP server reachable">⚪ Offline</span>`;
+      const stats = providerStats.get(addr.toLowerCase()) ?? { served: 0, slashed: 0 };
+      const servedCell = stats.served > 0
+        ? `<span class="prov-stat-ok">${stats.served}</span>`
+        : `<span class="prov-stat-zero">0</span>`;
+      const slashedCell = stats.slashed > 0
+        ? `<span class="prov-stat-err">${stats.slashed}</span>`
+        : `<span class="prov-stat-zero">0</span>`;
       return `
         <tr>
           <td><code>${shortAddr(addr)}</code></td>
           <td>${p.capacityGB}</td>
           <td>${p.pricePerGB}</td>
           <td>${ethers.formatEther(p.stake)}</td>
+          <td title="Deals successfully completed by this provider">${servedCell}</td>
+          <td title="Times this provider's stake was slashed (failed proof / no-show)">${slashedCell}</td>
           <td>${statusBadge}</td>
         </tr>`;
     })
   );
   document.getElementById("providers-tbody").innerHTML = rows.join("");
+}
+
+// Iterate completed + slashed deals to build a per-provider tally.
+// Cached in providerStats Map; recomputed every refresh cycle (cheap: 2 event
+// queries + N getDeal calls).
+async function refreshProviderStats() {
+  const [completedEvs, slashedEvs] = await Promise.all([
+    storageDeal.queryFilter(storageDeal.filters.DealCompleted(), 0, "latest"),
+    storageDeal.queryFilter(storageDeal.filters.DealSlashed(), 0, "latest"),
+  ]);
+  const fresh = new Map();
+  const tally = async (events, key) => {
+    for (const ev of events) {
+      const dealId = ev.args.dealId;
+      const deal = await storageDeal.getDeal(dealId);
+      const addr = deal.provider.toLowerCase();
+      const s = fresh.get(addr) ?? { served: 0, slashed: 0 };
+      s[key]++;
+      fresh.set(addr, s);
+    }
+  };
+  await tally(completedEvs, "served");
+  await tally(slashedEvs, "slashed");
+  providerStats.clear();
+  fresh.forEach((v, k) => providerStats.set(k, v));
 }
 
 async function fetchVerifiedFlags(dealId, totalChunks) {
@@ -735,8 +782,12 @@ async function runDemo() {
       return;
     }
 
-    appendEvent(`POST ${cfg.providerUrl}/store?dealId=${dealId}`);
-    const resp = await fetch(`${cfg.providerUrl}/store?dealId=${dealId}`, {
+    const providerUrl = providerUrls.get(sel.address.toLowerCase());
+    if (!providerUrl) {
+      throw new Error(`No HTTP URL configured for provider ${sel.address}`);
+    }
+    appendEvent(`POST ${providerUrl}/store?dealId=${dealId}`);
+    const resp = await fetch(`${providerUrl}/store?dealId=${dealId}`, {
       method: "POST",
       body: data,
     });

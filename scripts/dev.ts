@@ -8,9 +8,9 @@
  * Then open http://localhost:3000 in a browser.
  *
  * This script:
- *   1. Deploys both contracts via Ignition (no-ops if already deployed).
- *   2. Registers 3 providers (one online, two offline-but-on-chain).
- *   3. Starts the provider HTTP server on :8080.
+ *   1. Deploys both contracts via Ignition (clearing any stale Ignition cache).
+ *   2. Registers 5 providers (3 with HTTP servers, 2 on-chain-only).
+ *   3. Starts one HTTP server per online provider (ports 8080, 8081, 8082).
  *   4. Writes dashboard/addresses.json so the front-end can find everything.
  *   5. Serves dashboard/ on :3000 as a static site + exposes POST /redeploy
  *      so the dashboard's "Reset Chain" button can self-heal after wiping
@@ -20,27 +20,45 @@
 import http from "node:http";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { Mnemonic, HDNodeWallet } from "ethers";
 import { ethers, ignition } from "hardhat";
 import DePIN from "../ignition/modules/DePIN";
 import { startProviderServer } from "../agents/provider/server";
 import { ProviderRegistry__factory } from "../typechain-types";
 
-const PROVIDER_KEY =
-  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"; // signer 1 (online provider)
 const DASHBOARD_PORT = 3000;
-const PROVIDER_PORT = 8080;
 const RPC_URL = "http://127.0.0.1:8545";
-const PROVIDER_STORAGE_DIR = "./.provider-storage";
+const PROVIDER_STORAGE_ROOT = "./.provider-storage";
 
-// Three providers are registered to make the marketplace visible in the
-// dashboard. Only the first one runs an HTTP server (PROVIDER_KEY above),
-// so deals created in the demo go to signer #1. The others demonstrate
-// that the on-chain registry is a real list, not a single hardcoded slot.
-type ProviderSpec = { signerIndex: number; capacityGB: bigint; pricePerGB: bigint; stake: bigint };
+// Hardhat's default-mnemonic accounts are deterministic — we derive each
+// signer's private key from the same mnemonic so each provider HTTP server
+// can sign as the correct on-chain address. Public knowledge; only safe
+// because these accounts only ever fund local dev networks.
+const HARDHAT_MNEMONIC = "test test test test test test test test test test test junk";
+function privateKeyForSigner(index: number): string {
+  const mnemonic = Mnemonic.fromPhrase(HARDHAT_MNEMONIC);
+  const wallet = HDNodeWallet.fromMnemonic(mnemonic, `m/44'/60'/0'/0/${index}`);
+  return wallet.privateKey;
+}
+
+// Five providers register on-chain. The first three run an HTTP server each
+// (different ports) — they are "online" providers actually capable of
+// fulfilling deals. The last two are listed in the registry but unreachable,
+// to demonstrate that the on-chain marketplace doesn't guarantee
+// availability and the protocol's slash mechanism protects consumers.
+type ProviderSpec = {
+  signerIndex: number;
+  capacityGB: bigint;
+  pricePerGB: bigint;
+  stake: bigint;
+  port?: number; // if set, an HTTP server is spawned for this provider
+};
 const PROVIDER_REGISTRATIONS: ProviderSpec[] = [
-  { signerIndex: 1, capacityGB: 1000n, pricePerGB: 100n, stake: 5_000_000_000_000_000_000n }, // 5 ETH
-  { signerIndex: 3, capacityGB:  500n, pricePerGB:  50n, stake: 3_000_000_000_000_000_000n }, // 3 ETH (cheapest)
-  { signerIndex: 4, capacityGB: 2000n, pricePerGB: 200n, stake: 10_000_000_000_000_000_000n },// 10 ETH (largest)
+  { signerIndex: 1, capacityGB: 1000n, pricePerGB: 100n, stake: 5_000_000_000_000_000_000n,  port: 8080 },
+  { signerIndex: 3, capacityGB:  500n, pricePerGB:  50n, stake: 3_000_000_000_000_000_000n,  port: 8081 }, // cheapest
+  { signerIndex: 4, capacityGB: 2000n, pricePerGB: 200n, stake: 10_000_000_000_000_000_000n, port: 8082 }, // biggest
+  { signerIndex: 5, capacityGB:  750n, pricePerGB:  75n, stake: 4_000_000_000_000_000_000n  }, // offline
+  { signerIndex: 6, capacityGB: 1500n, pricePerGB: 150n, stake: 7_000_000_000_000_000_000n  }, // offline
 ];
 
 const MIME: Record<string, string> = {
@@ -52,13 +70,13 @@ const MIME: Record<string, string> = {
   ".svg": "image/svg+xml",
 };
 
+type ProviderEntry = { address: string; url: string };
 type Addresses = {
   chainId: number;
   rpcUrl: string;
-  providerUrl: string;
   registry: string;
   storageDeal: string;
-  providerSigner: string;
+  providers: ProviderEntry[]; // online providers only — those with HTTP servers
 };
 
 const DASHBOARD_DIR = path.resolve("dashboard");
@@ -69,12 +87,10 @@ const IGNITION_CACHE_DIR = path.join("ignition", "deployments", "chain-31337");
  * Idempotently bring the on-chain state to "ready":
  * - deploy contracts via Ignition (clearing the cache first so a freshly
  *   hardhat_reset'd chain doesn't trip Ignition's stale-deployment check)
- * - register the three provider signers if they're not already active
+ * - register all five provider signers if they're not already active
  * - write the dashboard addresses file
- *
- * Returns the addresses for the caller.
  */
-async function deployAndRegister(): Promise<Addresses> {
+async function deployAndRegister(onlineProviders: ProviderEntry[]): Promise<Addresses> {
   // After hardhat_reset, the on-chain bytecode is gone but Ignition still
   // remembers it deployed something at chain-31337 — that mismatch makes
   // future deploys fail. Wiping the cache before each deploy keeps things
@@ -96,14 +112,12 @@ async function deployAndRegister(): Promise<Addresses> {
     ).wait();
   }
 
-  const providerSigner = signers[1];
   const addresses: Addresses = {
     chainId: 31337,
     rpcUrl: RPC_URL,
-    providerUrl: `http://localhost:${PROVIDER_PORT}`,
     registry: registryAddr,
     storageDeal: storageDealAddr,
-    providerSigner: providerSigner.address,
+    providers: onlineProviders,
   };
   await fsp.mkdir(DASHBOARD_DIR, { recursive: true });
   await fsp.writeFile(ADDRESSES_FILE, JSON.stringify(addresses, null, 2));
@@ -113,34 +127,53 @@ async function deployAndRegister(): Promise<Addresses> {
 async function main(): Promise<void> {
   console.log("=== DePIN dev stack ===\n");
 
-  // 1+2+4. Deploy + register + write addresses
+  // Spawn an HTTP server for each online provider. We need to do this BEFORE
+  // computing the online-providers list for addresses.json so we have the
+  // addresses + URLs. Contracts haven't been deployed yet — but the provider
+  // server's startup checks (it queries getProvider) tolerate that briefly
+  // because we register providers immediately after.
+  // To keep things simple we deploy first, then start servers.
+
   console.log("1. Deploying contracts + registering providers...");
-  const addresses = await deployAndRegister();
+  // First deploy with empty online list — we'll write a fuller addresses.json
+  // after we start the servers and know their actual URLs.
+  let addresses = await deployAndRegister([]);
   console.log(`   ProviderRegistry: ${addresses.registry}`);
   console.log(`   StorageDeal:      ${addresses.storageDeal}`);
-  console.log(`   Registered ${PROVIDER_REGISTRATIONS.length} providers (signer #1 online, others offline)\n`);
+  console.log(`   Registered ${PROVIDER_REGISTRATIONS.length} providers ` +
+              `(${PROVIDER_REGISTRATIONS.filter(p => p.port !== undefined).length} online, ` +
+              `${PROVIDER_REGISTRATIONS.filter(p => p.port === undefined).length} offline)\n`);
 
-  // 3. Provider HTTP server (the addresses are stable on chain-31337 because
-  // Hardhat's signer #0 nonce resets to 0, and CREATE addresses are
-  // deterministic from (deployer, nonce). So the URL we pass here is still
-  // valid after a hardhat_reset + redeploy.)
-  console.log("2. Starting provider HTTP server...");
-  const ps = await startProviderServer({
-    rpcUrl: RPC_URL,
-    privateKey: PROVIDER_KEY,
-    registryAddress: addresses.registry,
-    storageDealAddress: addresses.storageDeal,
-    storageDir: PROVIDER_STORAGE_DIR,
-    port: PROVIDER_PORT,
-    chunkSize: 512,
-  });
-  console.log(`   listening on http://localhost:${ps.port}\n`);
+  console.log("2. Starting provider HTTP servers...");
+  const signers = await ethers.getSigners();
+  const servers: Awaited<ReturnType<typeof startProviderServer>>[] = [];
+  const onlineEntries: ProviderEntry[] = [];
+  for (const spec of PROVIDER_REGISTRATIONS) {
+    if (spec.port === undefined) continue;
+    const signer = signers[spec.signerIndex];
+    const dir = path.join(PROVIDER_STORAGE_ROOT, `port-${spec.port}`);
+    const ps = await startProviderServer({
+      rpcUrl: RPC_URL,
+      privateKey: privateKeyForSigner(spec.signerIndex),
+      registryAddress: addresses.registry,
+      storageDealAddress: addresses.storageDeal,
+      storageDir: dir,
+      port: spec.port,
+      chunkSize: 512,
+    });
+    servers.push(ps);
+    onlineEntries.push({ address: signer.address, url: `http://localhost:${spec.port}` });
+    console.log(`   - ${signer.address} (signer #${spec.signerIndex})  →  http://localhost:${spec.port}`);
+  }
+  console.log();
 
-  // 5. Static dashboard server + /redeploy endpoint
+  // Rewrite addresses.json now that we know all the URLs.
+  addresses = { ...addresses, providers: onlineEntries };
+  await fsp.writeFile(ADDRESSES_FILE, JSON.stringify(addresses, null, 2));
+
+  // Static dashboard server + /redeploy endpoint.
   const staticServer = http.createServer(async (req, res) => {
     try {
-      // CORS preflight + open access so the dashboard (same origin actually,
-      // but kept permissive for cross-origin testing) can POST /redeploy.
       if (req.method === "OPTIONS") {
         res.writeHead(204, {
           "Access-Control-Allow-Origin": "*",
@@ -152,12 +185,14 @@ async function main(): Promise<void> {
 
       const url = new URL(req.url ?? "/", `http://localhost:${DASHBOARD_PORT}`);
 
-      // POST /redeploy — the "Reset Chain" button in the dashboard calls this
-      // right after a hardhat_reset so the page can self-heal without the
-      // user needing to restart this script.
+      // POST /redeploy — the "Reset Chain" button calls this right after a
+      // hardhat_reset so the page can self-heal without the user needing to
+      // restart this script. Provider HTTP servers stay alive — their
+      // hard-coded contract addresses are still valid (deterministic CREATE
+      // addresses don't change between resets).
       if (req.method === "POST" && url.pathname === "/redeploy") {
         try {
-          const addrs = await deployAndRegister();
+          const addrs = await deployAndRegister(onlineEntries);
           res.writeHead(200, {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
@@ -196,16 +231,15 @@ async function main(): Promise<void> {
   });
   staticServer.listen(DASHBOARD_PORT, () => {
     console.log(`3. Dashboard:           http://localhost:${DASHBOARD_PORT}`);
-    console.log(`   Provider API:        http://localhost:${PROVIDER_PORT}`);
     console.log(`   Hardhat JSON-RPC:    ${RPC_URL}`);
     console.log(`   Redeploy endpoint:   POST http://localhost:${DASHBOARD_PORT}/redeploy\n`);
     console.log("Press Ctrl-C to stop.\n");
   });
 
-  // Graceful shutdown
+  // Graceful shutdown — close every provider server in parallel.
   const shutdown = async () => {
     console.log("\nShutting down...");
-    await ps.close();
+    await Promise.all(servers.map(s => s.close()));
     staticServer.close();
     process.exit(0);
   };
