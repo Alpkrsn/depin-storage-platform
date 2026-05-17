@@ -47,10 +47,10 @@ contract ProviderRegistry is ReentrancyGuard, Ownable {
 
     /// @notice One-shot wiring: the deployer points the registry at the StorageDeal contract.
     /// @dev Required because StorageDeal cannot exist at registry deploy time (circular dependency).
-    function setStorageDealContract(address _storageDeal) external onlyOwner {
-        if (_storageDeal == address(0)) revert ZeroAddress();
-        storageDealContract = _storageDeal;
-        emit StorageDealContractSet(_storageDeal);
+    function setStorageDealContract(address dealContract) external onlyOwner {
+        if (dealContract == address(0)) revert ZeroAddress();
+        storageDealContract = dealContract;
+        emit StorageDealContractSet(dealContract);
     }
 
     /// @notice Register (or re-activate) the caller as a provider. msg.value is added to stake.
@@ -95,6 +95,7 @@ contract ProviderRegistry is ReentrancyGuard, Ownable {
         if (amount == 0) revert NothingToWithdraw();
 
         p.stake = 0;
+        // slither-disable-next-line low-level-calls — standard ETH transfer; status checked below.
         (bool ok, ) = msg.sender.call{value: amount}("");
         if (!ok) revert TransferFailed();
         emit StakeWithdrawn(msg.sender, amount);
@@ -115,6 +116,7 @@ contract ProviderRegistry is ReentrancyGuard, Ownable {
         if (slashed == 0) return; // nothing to do, no event spam
 
         p.stake -= slashed;
+        // slither-disable-next-line low-level-calls — standard ETH transfer; status checked below.
         (bool ok, ) = beneficiary.call{value: slashed}("");
         if (!ok) revert TransferFailed();
         emit ProviderSlashed(provider, slashed, beneficiary);
@@ -130,14 +132,14 @@ contract ProviderRegistry is ReentrancyGuard, Ownable {
     /// @dev O(n) over every provider that has ever registered. Fine for the prototype scale.
     function getActiveProviders() external view returns (address[] memory) {
         uint256 total = providerList.length;
-        uint256 count;
-        for (uint256 i; i < total; ++i) {
+        uint256 count = 0;
+        for (uint256 i = 0; i < total; ++i) {
             if (providers[providerList[i]].active) ++count;
         }
 
         address[] memory active = new address[](count);
-        uint256 j;
-        for (uint256 i; i < total; ++i) {
+        uint256 j = 0;
+        for (uint256 i = 0; i < total; ++i) {
             address a = providerList[i];
             if (providers[a].active) {
                 active[j] = a;

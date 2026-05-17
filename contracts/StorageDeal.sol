@@ -145,6 +145,7 @@ contract StorageDeal is ReentrancyGuard {
     function closeDeal(uint256 dealId) external nonReentrant {
         Deal storage d = deals[dealId];
         if (d.status != Status.Active) revert DealNotActive();
+        // slither-disable-next-line timestamp — deadlines are minutes/hours; ±15s miner drift is harmless.
         if (block.timestamp < d.deadline) revert DeadlineNotReached();
 
         uint256 challengeIndex = block.prevrandao % uint256(d.totalChunks);
@@ -158,12 +159,14 @@ contract StorageDeal is ReentrancyGuard {
         if (ok) {
             // Effects before interaction: prevent re-entry re-running settlement.
             d.status = Status.Completed;
+            // slither-disable-next-line low-level-calls — standard ETH transfer; status checked.
             (bool sent, ) = provider.call{value: escrow}("");
             if (!sent) revert TransferFailed();
             emit DealCompleted(dealId, challengeIndex, escrow);
         } else {
             d.status = Status.Slashed;
             // Refund the consumer.
+            // slither-disable-next-line low-level-calls — standard ETH transfer; status checked.
             (bool sent, ) = consumer.call{value: escrow}("");
             if (!sent) revert TransferFailed();
             // Penalise the provider — slash() caps the amount at remaining stake, so this
